@@ -191,106 +191,92 @@ int tds_in_threshold_check(float vin, float tgt, float thresh)
 
 void* get_current_salinity(void * arg) {
 	int ret = 0;
-	//while (1) {
-		/**
-		 * set buffer to 3 byte command to initialize ans1115
-		 * if necessary see the TI ANS1115 datasheet to decode
-		 */
-		i2c_set_send_buf(0x1, 0x42, 0x85);
-		ret = i2c_send(3);
+	/**
+	* set buffer to 3 byte command to initialize ans1115
+	* if necessary see the TI ANS1115 datasheet to decode
+	*/
+	i2c_set_send_buf(0x1, 0x42, 0x85);
+	ret = i2c_send(3);
+	if (ret != EOK) {
+		fprintf(stderr, "Failed to send ANS1115 init command\n");
+		errno = ret;
+		return NULL;
+	}
+
+	/**
+	 * spin and wait for signal back from asn1115
+	 * which confirms that the send command was successful
+	 */
+
+	while (1) {
+		/* set buf to 0 and send 1 byte */
+		i2c_set_send_buf(0x0, 0x0, 0x0);
+		ret = i2c_send(1);
 		if (ret != EOK) {
-			fprintf(stderr, "Failed to send ANS1115 init command\n");
+			fprintf(stderr, "Write register select failed ret:%d:%s\n", ret, strerror(ret));
+		}
+
+		/* recv the next 16 bits */
+		ret = i2c_recv(2);
+		if (ret != EOK) {
+			fprintf(stderr, "Read volts failed\n");
 			errno = ret;
-			return NULL;
 		}
 
-		/**
-		 * spin and wait for signal back from asn1115
-		 * which confirms that the send command was successful
-		 */
-//		do {
-//			printf("checking command successful\n");
-//			ret = i2c_recv(2);
-//			if (ret != EOK) {
-//				fprintf(stderr, "ANS1115 init failed\n");
-//				errno = ret;
-//				return NULL;
-//			}
-//		} while ((recvbuf[0] & 0b10000000) == 0);
-//
-		while (1) {
-			/* set buf to 0 and send 1 byte */
-			i2c_set_send_buf(0x0, 0x0, 0x0);
-			ret = i2c_send(1);
-			if (ret != EOK) {
-				fprintf(stderr, "Write register select failed ret:%d:%s\n", ret, strerror(ret));
-//				return NULL;
-			}
+		/* concat the two uint8_t into a correctly ordered uint16_t */
+		uint16_t vol = (uint16_t) recvbuf[0] * 256 + (uint16_t) recvbuf[1];
+		float volts = (float) vol * 4.096 / 32768.0;
 
-			/* recv the next 16 bits */
-			ret = i2c_recv(2);
-			if (ret != EOK) {
-				fprintf(stderr, "Read volts failed\n");
-				errno = ret;
-//				return NULL;
-			}
+		int tds;
+		pthread_mutex_lock(&mutex);
+		tds = g_tds;
+		pthread_mutex_unlock(&mutex);
+		if (tds == 0) {
+			printf("CB: tds target not set\n");
+			continue;
+		}
+		float tgt = tds_to_volts(tds);
 
-			/* concat the two uint8_t into a correctly ordered uint16_t */
-			uint16_t vol = (uint16_t) recvbuf[0] * 256 + (uint16_t) recvbuf[1];
-			float volts = (float) vol * 4.096 / 32768.0;
+		printf("volts:%f tgt:%f\n", volts, tgt);
 
-			int tds;
-			pthread_mutex_lock(&mutex);
-			tds = g_tds;
-			pthread_mutex_unlock(&mutex);
-			if (tds == 0) {
-				printf("CB: tds target not set\n");
-				continue;
-			}
-			float tgt = tds_to_volts(tds);
-
-			printf("volts:%f tgt:%f\n", volts, tgt);
-
-			if (tds_in_threshold_check(volts, tgt, 0.5)) {
-				/* close enough, stop switching the pumps */
+		if (tds_in_threshold_check(volts, tgt, 0.5)) {
+			/* close enough, stop switching the pumps */
+			turn_off_salty_pump();
+			turn_off_fresh_water_pump();
+			continue;
+		} else {
+			if (volts > tgt) {
+				/* turn off salty pump */
+				/* turn on fresh water pump */
 				turn_off_salty_pump();
+				turn_on_fresh_water_pump();
+				printf("CB: volts > tgt\n");
+				usleep(500);
+			}
+			if (volts < tgt) {
+				/* turn on salty pump */
+				/* turn off fresh water pump */
+				turn_on_salty_pump();
 				turn_off_fresh_water_pump();
-				continue;
-			} else {
-				if (volts > tgt) {
-					/* turn off salty pump */
-					/* turn on fresh water pump */
-					turn_off_salty_pump();
-					turn_on_fresh_water_pump();
-					printf("CB: volts > tgt\n");
-					usleep(500);
-				}
-				if (volts < tgt) {
-					/* turn on salty pump */
-					/* turn off fresh water pump */
-					turn_on_salty_pump();
-					turn_off_fresh_water_pump();
-					printf("CB: volts < tgt\n");
-					usleep(500);
-				}
+				printf("CB: volts < tgt\n");
+				usleep(500);
 			}
 		}
+	}
 }
 
 void* get_desired_salinity(void * arg) {
-//	int total = 0;
 	while(1) {
-		//pthread_mutex_lock(&mutex);
-			if( ( f = popen( buffer, "rw" ) ) == NULL ) {
-				 perror( "popen" );
-				 return NULL;
-			}
+		if( ( f = popen( buffer, "rw" ) ) == NULL ) {
+				perror( "popen" );
+				return NULL;
+		}
 
-			int out;
-			(void)fscanf(f, "{\"desired_salinity\":\"%d\"}", &out);
-			pthread_mutex_lock(&mutex);
-			g_tds = out;
-			pthread_mutex_unlock(&mutex);
+		int out;
+		(void)fscanf(f, "{\"desired_salinity\":\"%d\"}", &out);
+		pthread_mutex_lock(&mutex);
+		g_tds = out;
+		pthread_mutex_unlock(&mutex);
 	}
 }
 
@@ -304,7 +290,6 @@ int main(void) {
 	// create thread to get desired salinity
 	pthread_create(&threads[0], NULL, get_desired_salinity, NULL);
 	int ret = 0;
-	//uint8_t *recvbuf;
 
 	/* initialize the global variables for i2c functions */
 	(void)i2c_init_ctx();
@@ -335,8 +320,6 @@ int main(void) {
 	pthread_create(&threads[1], NULL, get_current_salinity, NULL);
 	pthread_join(threads[1], NULL);
 	pthread_join(threads[0], NULL);
-	// if (current salinity < desired salinity: turn on salty pump, turn off water pump)
-	// if
 
 	return EXIT_SUCCESS;
 }
